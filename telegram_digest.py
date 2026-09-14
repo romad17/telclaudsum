@@ -43,6 +43,9 @@ SETUP
 
 NOTES
 -----
+- Chats are scanned concurrently (see DIALOG_CONCURRENCY below, default 8) to
+  speed things up. If you have a lot of chats and start hitting Telegram
+  flood-wait errors, lower that number.
 - This uses your real Telegram account (via Telethon / MTProto), not
   a bot, because bots cannot see channels/groups they weren't added
   to as admins. Only run this on a machine you trust — the session
@@ -164,24 +167,82 @@ async def fetch_dialog_messages(client, dialog, range_key, start_time):
 
 async def format_messages(messages):
     lines = []
+    sender_cache = {}  # sender_id -> resolved display name, avoids re-fetching per message
     for msg in messages:
         if not msg or (not msg.text and not msg.message):
             continue
-        sender = "Unknown"
-        try:
-            sender_entity = await msg.get_sender()
-            if sender_entity:
-                sender = getattr(sender_entity, "title", None) or \
-                          " ".join(filter(None, [
-                              getattr(sender_entity, "first_name", None),
-                              getattr(sender_entity, "last_name", None),
-                          ])) or getattr(sender_entity, "username", "Unknown")
-        except Exception:
-            pass
+        sender_id = msg.sender_id
+        if sender_id not in sender_cache:
+            name = "Unknown"
+            try:
+                sender_entity = await msg.get_sender()
+                if sender_entity:
+                    name = getattr(sender_entity, "title", None) or \
+                            " ".join(filter(None, [
+                                getattr(sender_entity, "first_name", None),
+                                getattr(sender_entity, "last_name", None),
+                            ])) or getattr(sender_entity, "username", "Unknown")
+            except Exception:
+                pass
+            sender_cache[sender_id] = name
+        sender = sender_cache[sender_id]
         ts = msg.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         text = msg.text or msg.message or "[non-text message]"
         lines.append(f"[{ts}] {sender}: {text}")
     return lines
+
+
+DIALOG_CONCURRENCY = 8  # how many chats to process at once; higher = faster but more flood-wait risk
+
+
+async def process_dialog(client, dialog, range_key, start_time, keep_unread, sem, index, total):
+    """Fetch, format, export, and (optionally) mark-read a single dialog. Bounded by sem."""
+    async with sem:
+        label = f"[{index}/{total}]"
+        entity = dialog.entity
+        is_group_or_channel = isinstance(entity, (Channel, Chat))
+
+        if not is_group_or_channel and not INCLUDE_DIRECT_MESSAGES:
+            print(f"{label} Skipping '{dialog.name}' (1:1 DM, not included)", flush=True)
+            return {"status": "skipped_dm", "name": dialog.name}
+
+        print(f"{label} Checking '{dialog.name}'...", flush=True)
+        try:
+            messages = await fetch_dialog_messages(client, dialog, range_key, start_time)
+        except Exception as e:
+            print(f"{label}   Failed to fetch messages for '{dialog.name}': {e}", flush=True)
+            return {"status": "skipped_empty", "name": dialog.name}
+
+        if not messages:
+            print(f"{label}   No matching messages, skipping.", flush=True)
+            return {"status": "skipped_empty", "name": dialog.name}
+
+        print(f"{label}   Found {len(messages)} message(s), formatting...", flush=True)
+        lines = await format_messages(messages)
+        if not lines:
+            print(f"{label}   Nothing text-based to export, skipping.", flush=True)
+            return {"status": "skipped_empty", "name": dialog.name}
+
+        filename = EXPORT_DIR / f"{sanitize_filename(dialog.name)}.txt"
+        filename.write_text("\n".join(lines), encoding="utf-8-sig")
+        print(f"{label}   Exported {len(lines)} message(s) -> {filename}", flush=True)
+
+        if not keep_unread:
+            try:
+                newest_id = messages[-1].id
+                await client.send_read_acknowledge(dialog, max_id=newest_id)
+                print(f"{label}   Marked as read.", flush=True)
+            except Exception as e:
+                print(f"{label}   Could not mark '{dialog.name}' as read: {e}", flush=True)
+        else:
+            print(f"{label}   Left as unread (--keep-unread set).", flush=True)
+
+        return {
+            "status": "exported",
+            "name": dialog.name,
+            "filename": filename,
+            "lines": lines,
+        }
 
 
 async def export_messages(client, range_key, keep_unread):
@@ -195,52 +256,29 @@ async def export_messages(client, range_key, keep_unread):
 
     print("Loading your chat list from Telegram...", flush=True)
     dialogs = await client.get_dialogs()
-    print(f"Found {len(dialogs)} total chats. Scanning...\n", flush=True)
+    print(f"Found {len(dialogs)} total chats. Scanning (up to {DIALOG_CONCURRENCY} at a time)...\n", flush=True)
+
+    sem = asyncio.Semaphore(DIALOG_CONCURRENCY)
+    tasks = [
+        process_dialog(client, dialog, range_key, start_time, keep_unread, sem, i, len(dialogs))
+        for i, dialog in enumerate(dialogs, start=1)
+    ]
+    results = await asyncio.gather(*tasks)
 
     exported_files = []
     combined_chunks = []
     skipped_dm = 0
     skipped_empty = 0
 
-    for i, dialog in enumerate(dialogs, start=1):
-        entity = dialog.entity
-        is_group_or_channel = isinstance(entity, (Channel, Chat))
-        label = f"[{i}/{len(dialogs)}]"
-
-        if not is_group_or_channel and not INCLUDE_DIRECT_MESSAGES:
+    # Preserve original dialog order in the combined digest, even though fetches ran concurrently.
+    for r in results:
+        if r["status"] == "exported":
+            exported_files.append((r["name"], r["filename"]))
+            combined_chunks.append(f"===== {r['name']} =====\n" + "\n".join(r["lines"]))
+        elif r["status"] == "skipped_dm":
             skipped_dm += 1
-            print(f"{label} Skipping '{dialog.name}' (1:1 DM, not included)", flush=True)
-            continue
-
-        print(f"{label} Checking '{dialog.name}'...", flush=True)
-        messages = await fetch_dialog_messages(client, dialog, range_key, start_time)
-        if not messages:
-            skipped_empty += 1
-            print(f"{label}   No matching messages, skipping.", flush=True)
-            continue
-
-        print(f"{label}   Found {len(messages)} message(s), formatting...", flush=True)
-        lines = await format_messages(messages)
-        if not lines:
-            skipped_empty += 1
-            print(f"{label}   Nothing text-based to export, skipping.", flush=True)
-            continue
-
-        filename = EXPORT_DIR / f"{sanitize_filename(dialog.name)}.txt"
-        filename.write_text("\n".join(lines), encoding="utf-8")
-        exported_files.append((dialog.name, filename))
-        combined_chunks.append(f"===== {dialog.name} =====\n" + "\n".join(lines))
-        print(f"{label}   Exported {len(lines)} message(s) -> {filename}", flush=True)
-
-        if not keep_unread:
-            try:
-                newest_id = messages[-1].id
-                await client.send_read_acknowledge(dialog, max_id=newest_id)
-                print(f"{label}   Marked as read.", flush=True)
-            except Exception as e:
-                print(f"{label}   Could not mark '{dialog.name}' as read: {e}", flush=True)
         else:
-            print(f"{label}   Left as unread (--keep-unread set).", flush=True)
+            skipped_empty += 1
 
     print(
         f"\nScan complete: {len(exported_files)} chat(s) exported, "
@@ -250,7 +288,7 @@ async def export_messages(client, range_key, keep_unread):
 
     if combined_chunks:
         print(f"Writing combined digest to {COMBINED_FILE}...", flush=True)
-        COMBINED_FILE.write_text("\n\n".join(combined_chunks), encoding="utf-8")
+        COMBINED_FILE.write_text("\n\n".join(combined_chunks), encoding="utf-8-sig")
 
     return exported_files
 
